@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 import yt_dlp
 import re
@@ -18,6 +18,8 @@ import warnings
 import logging
 from urllib.parse import unquote
 from dotenv import load_dotenv
+from functools import wraps
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -28,7 +30,33 @@ logging.getLogger('yt_dlp').setLevel(logging.ERROR)
 os.environ['YTDLP_NO_UPDATE'] = '1'
 
 app = Flask(__name__, static_folder='../', static_url_path='')
-CORS(app)
+CORS(app, origins=["*"])  # Allow all origins for worldwide access
+
+# ============================================================
+# RATE LIMITING (IP-based)
+# ============================================================
+rate_limit_store = {}
+RATE_LIMIT = int(os.environ.get('RATE_LIMIT', 10))  # 10 requests per minute per IP
+
+def rate_limiter(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        client_ip = request.remote_addr
+        now = time.time()
+        minute_ago = now - 60
+        
+        if client_ip not in rate_limit_store:
+            rate_limit_store[client_ip] = []
+        
+        # Clean old requests
+        rate_limit_store[client_ip] = [t for t in rate_limit_store[client_ip] if t > minute_ago]
+        
+        if len(rate_limit_store[client_ip]) >= RATE_LIMIT:
+            return jsonify({'error': f'Rate limit exceeded. Max {RATE_LIMIT} requests per minute.'}), 429
+        
+        rate_limit_store[client_ip].append(now)
+        return f(*args, **kwargs)
+    return decorated
 
 # ============================================================
 # CROSS-PLATFORM DOWNLOAD FOLDER DETECTION
@@ -91,7 +119,7 @@ if not FFMPEG_AVAILABLE:
 # ============================================================
 # CONFIGURATION
 # ============================================================
-MAX_CONCURRENT_DOWNLOADS = 2
+MAX_CONCURRENT_DOWNLOADS = 3
 active_downloads_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 download_status = {}
@@ -107,9 +135,20 @@ if not EMAIL_SENDER or not EMAIL_PASSWORD:
     print("⚠️ Email credentials not set. Email features disabled.")
 
 # ============================================================
-# HELPER FUNCTIONS
+# SECURITY HELPER FUNCTIONS
 # ============================================================
+def sanitize_input(data):
+    """Sanitize user input to prevent injection"""
+    if isinstance(data, str):
+        return re.sub(r'[^\w\-\./:?=&]', '', data)[:500]
+    return data
+
+def generate_download_token():
+    """Generate unique token for download verification"""
+    return hashlib.sha256(f"{uuid.uuid4()}{time.time()}".encode()).hexdigest()[:16]
+
 def cleanup_old_status():
+    """Prevent memory leak - remove old status entries after 24 hours"""
     expire_time = datetime.now() - timedelta(hours=24)
     to_remove = [did for did, ts in download_timestamps.items() if ts < expire_time]
     for did in to_remove:
@@ -120,6 +159,7 @@ def cleanup_old_status():
         download_timestamps.pop(did, None)
 
 def validate_time_format(time_str):
+    """SECURITY: Validate time format to prevent command injection"""
     if not time_str:
         return True
     pattern = r'^(\d{1,2}:)?\d{1,2}:\d{2}$'
@@ -135,8 +175,10 @@ def validate_time_format(time_str):
     return False
 
 def clean_filename(name):
+    """SECURITY: Clean filename - only allow safe characters"""
     if not name:
         return "video"
+    # Only allow alphanumeric, underscore, hyphen, dot
     name = re.sub(r'[^a-zA-Z0-9_\-\.]', '', name)
     if len(name) > 50:
         name = name[:50]
@@ -144,6 +186,7 @@ def clean_filename(name):
     return name if name else "video"
 
 def is_safe_path(file_path, base_folder):
+    """SECURITY: Prevent path traversal attacks"""
     try:
         resolved_path = file_path.resolve()
         resolved_base = base_folder.resolve()
@@ -190,6 +233,7 @@ def time_to_seconds(time_str):
     return None
 
 def trim_video(input_path, output_path, start_time, end_time):
+    """SECURITY: Validate time before ffmpeg"""
     if not FFMPEG_AVAILABLE:
         return False
     if not validate_time_format(start_time) or not validate_time_format(end_time):
@@ -227,8 +271,6 @@ def send_email_notification(filename, file_path, recipient_email):
         <h2>Your download is ready!</h2>
         <p>File: <strong>{filename}</strong></p>
         <p>Size: {format_size(file_path.stat().st_size)}</p>
-        <p>Saved to: Saverlian folder</p>
-        <br>
         <p>Thank you for using Saverlian!</p>
         """
         msg.attach(MIMEText(body, 'html'))
@@ -259,6 +301,7 @@ def send_telegram_notification(bot_token, chat_id, filename, file_path):
         return False
 
 def get_error_category(error_msg):
+    """Categorize error for better user feedback"""
     error_lower = error_msg.lower()
     if "network" in error_lower or "connection" in error_lower or "timeout" in error_lower:
         return "Network error. Please check your internet connection."
@@ -273,7 +316,7 @@ def get_error_category(error_msg):
     elif "permission" in error_lower or "access" in error_lower:
         return "Permission denied. Cannot save file."
     else:
-        return error_msg[:100]
+        return "An error occurred. Please try again."
 
 def download_worker(download_id, url, quality, download_title, download_type, audio_format, advanced_options=None, retry_count=0):
     max_retries = 3
@@ -463,7 +506,18 @@ def schedule_worker(download_id, url, quality, title, download_type, audio_forma
 # ============================================================
 @app.route('/')
 def serve_index():
-    return send_from_directory('..', 'index.html')
+    return jsonify({
+        'name': 'Saverlian API',
+        'version': '2.0',
+        'status': 'online',
+        'endpoints': {
+            'health': '/api/health',
+            'get_info': '/api/get_info (POST)',
+            'download': '/api/download (POST)',
+            'status': '/api/status/{id} (GET)',
+            'get_file': '/api/get_file/{filename} (GET)'
+        }
+    })
 
 @app.route('/beauty/<path:path>')
 def serve_beauty(path):
@@ -482,14 +536,16 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'ffmpeg': FFMPEG_AVAILABLE,
-        'download_folder': str(DOWNLOAD_FOLDER)
+        'download_folder': str(DOWNLOAD_FOLDER),
+        'version': '2.0'
     })
 
 @app.route('/api/get_info', methods=['POST'])
+@rate_limiter
 def get_video_info():
     try:
         data = request.get_json()
-        url = data.get('url', '').strip()
+        url = sanitize_input(data.get('url', '').strip())
         
         if not url:
             return jsonify({'error': 'URL is required'}), 400
@@ -523,20 +579,21 @@ def get_video_info():
         return jsonify({'error': get_error_category(str(e))}), 500
 
 @app.route('/api/download', methods=['POST'])
+@rate_limiter
 def start_download():
     try:
         data = request.get_json()
-        url = data.get('url', '').strip()
+        url = sanitize_input(data.get('url', '').strip())
         quality = data.get('format_id', 'best')
         download_type = data.get('download_type', 'video')
         audio_format = data.get('audio_format', 'mp3_192')
-        trim_start = data.get('trim_start')
-        trim_end = data.get('trim_end')
+        trim_start = sanitize_input(data.get('trim_start'))
+        trim_end = sanitize_input(data.get('trim_end'))
         compress = data.get('compress', False)
         schedule_time = data.get('schedule_time')
-        email = data.get('email')
-        telegram_bot = data.get('telegram_bot')
-        telegram_chat = data.get('telegram_chat')
+        email = sanitize_input(data.get('email'))
+        telegram_bot = sanitize_input(data.get('telegram_bot'))
+        telegram_chat = sanitize_input(data.get('telegram_chat'))
         
         if not url:
             return jsonify({'error': 'URL required'}), 400
@@ -587,10 +644,11 @@ def pause_download(download_id):
     return jsonify({'error': 'Download not found'}), 404
 
 @app.route('/api/resume/<download_id>', methods=['POST'])
+@rate_limiter
 def resume_download(download_id):
     try:
         data = request.get_json()
-        url = data.get('url')
+        url = sanitize_input(data.get('url'))
         quality = data.get('format_id', 'best')
         download_type = data.get('download_type', 'video')
         audio_format = data.get('audio_format', 'mp3_192')
@@ -645,6 +703,7 @@ def get_status(download_id):
 
 @app.route('/api/get_file/<filename>')
 def get_file(filename):
+    # SECURITY: Prevent path traversal
     filename = unquote(filename)
     safe_filename = clean_filename(filename)
     file_path = DOWNLOAD_FOLDER / safe_filename
@@ -653,11 +712,12 @@ def get_file(filename):
         return jsonify({'error': 'Invalid file path'}), 403
     
     if file_path.exists():
-        return send_file(file_path, as_attachment=True, download_name=safe_filename)
+        return send_file(file_path, as_attachment=True, download_name=safe_filename, mimetype='video/mp4')
     
+    # Try to find by partial match (safe)
     for file in DOWNLOAD_FOLDER.iterdir():
         if is_safe_path(file, DOWNLOAD_FOLDER) and (safe_filename in file.name or file.name.startswith(safe_filename[:40])):
-            return send_file(file, as_attachment=True, download_name=file.name)
+            return send_file(file, as_attachment=True, download_name=file.name, mimetype='video/mp4')
     
     return jsonify({'error': 'File not found'}), 404
 
@@ -677,10 +737,13 @@ def cleanup_temp_files():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"\n{'='*40}")
-    print(f" Saverlian Downloader")
-    print(f" Save: {DOWNLOAD_FOLDER}")
-    print(f" FFmpeg: {'Available' if FFMPEG_AVAILABLE else 'Not available'}")
-    print(f" Email: {'Configured' if EMAIL_SENDER else 'Not configured'}")
-    print(f"{'='*40}\n")
+    print(f"\n{'='*50}")
+    print(f" Saverlian Downloader v2.0")
+    print(f" Server: http://0.0.0.0:{port}")
+    print(f" Save path: {DOWNLOAD_FOLDER}")
+    print(f" FFmpeg: {'✅ Available' if FFMPEG_AVAILABLE else '❌ Not available'}")
+    print(f" Email: {'✅ Configured' if EMAIL_SENDER else '❌ Not configured'}")
+    print(f" Rate Limit: {RATE_LIMIT} requests/minute per IP")
+    print(f" Max Concurrent: {MAX_CONCURRENT_DOWNLOADS}")
+    print(f"{'='*50}\n")
     app.run(debug=False, host='0.0.0.0', port=port)
